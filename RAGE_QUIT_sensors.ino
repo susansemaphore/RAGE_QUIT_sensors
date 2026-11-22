@@ -2,9 +2,15 @@
 
 const uint8_t MPU_ADDR = 0x68;
 
-// Default sensitivity scale factors (±2g and ±250 °/s)
-const float ACCEL_SCALE = 16384.0f; // LSB/g
-const float GYRO_SCALE  = 131.0f;   // LSB/(°/s)
+// Full-scale ranges: ±4 g and ±500 °/s. On the defaults (±2 g, ±250 °/s) impacts clipped at 2.000 g and
+// strong flips reached ~247 °/s, so harder flips would all have read the same.
+const uint8_t REG_PWR_MGMT_1  = 0x6B;
+const uint8_t REG_GYRO_CONFIG = 0x1B;
+const uint8_t REG_ACCEL_CONFIG = 0x1C;
+const uint8_t GYRO_RANGE_500DPS = 0x08; // FS_SEL = 1
+const uint8_t ACCEL_RANGE_4G    = 0x08; // AFS_SEL = 1
+const float ACCEL_SCALE = 8192.0f; // LSB/g at ±4 g
+const float GYRO_SCALE  = 65.5f;   // LSB/(°/s) at ±500 °/s
 
 // Timing intervals (ms)
 const unsigned long CALIBRATION_MS         = 2000;
@@ -84,6 +90,62 @@ float holdBaseAz = 0.0f;
 // Round return-to-start tracking
 bool trackingHomeCandidate = false;
 unsigned long homeCandidateSinceMs = 0;
+
+// Commands from the PC, one per line (see README)
+char commandBuf[16];
+uint8_t commandLen = 0;
+
+// Returns 0 on success, otherwise the Wire error code (e.g. 2 = sensor didn't answer: check wiring).
+uint8_t writeRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission();
+}
+
+// Every return to idle is announced, so the PC always knows the table is back down.
+void announceScenarioSelect() {
+  Serial.println("STATUS:SCENARIO_SELECT (TWITCH to scroll, HOLD 1s to select)");
+}
+
+// Sent whenever the 1 s hold timer starts or restarts, with the time still needed, so the PC can fill a bar in step.
+void announceHoldStart() {
+  Serial.print("STATUS:HOLD_START ");
+  Serial.println(HOLD_REQUIRED_MS);
+}
+
+void startCalibration(unsigned long now) {
+  calibAxSum = calibAzSum = calibGxSum = calibGySum = calibGzSum = 0.0;
+  calibSamples = 0;
+  holdingAngle = false;
+  trackingHomeCandidate = false;
+  bootMs = now;
+  state = STATE_CALIBRATING;
+  Serial.println("*** STATE: STATE_CALIBRATING ***");
+}
+
+void runCommand(const char* cmd) {
+  if (strcmp(cmd, "PING") == 0) {
+    Serial.println("PONG RAGE_QUIT");
+  } else if (strcmp(cmd, "CAL") == 0) {
+    startCalibration(millis());
+  }
+}
+
+void readCommands() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (commandLen > 0) {
+        commandBuf[commandLen] = '\0';
+        runCommand(commandBuf);
+        commandLen = 0;
+      }
+    } else if (commandLen < sizeof(commandBuf) - 1) {
+      commandBuf[commandLen++] = (char)toupper(c);
+    }
+  }
+}
 
 float computeAverage(const float* buf, uint8_t count) {
   if (count == 0) return 0.0f;
@@ -174,28 +236,26 @@ void setup() {
 
   Wire.begin();
 
-  // Wake MPU6050
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B);
-  Wire.write(0x00);
-  byte status = Wire.endTransmission();
+  // Wake MPU6050, then set the wider ranges that ACCEL_SCALE and GYRO_SCALE assume
+  uint8_t error = writeRegister(REG_PWR_MGMT_1, 0x00);
+  if (error == 0) error = writeRegister(REG_GYRO_CONFIG, GYRO_RANGE_500DPS);
+  if (error == 0) error = writeRegister(REG_ACCEL_CONFIG, ACCEL_RANGE_4G);
 
-  if (status != 0) {
+  if (error != 0) {
     Serial.print("MPU6050 init failed, error: ");
-    Serial.println(status);
+    Serial.println(error);
     while (true) {
       delay(1000);
     }
   }
 
-  bootMs = millis();
-  lastSampleMs = bootMs;
-
   Serial.println("t_ms,ax,az,gx,gy,gz");
-  Serial.println("*** STATE: STATE_CALIBRATING ***");
+  startCalibration(millis());
+  lastSampleMs = bootMs;
 }
 
 void loop() {
+  readCommands();
   unsigned long now = millis();
 
   if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
@@ -262,7 +322,7 @@ void loop() {
       // Held selection stays active until the table is lowered back to rest
       if (nearRest) {
         state = STATE_SCENARIO_SELECT;
-        Serial.println("STATUS:SCENARIO_SELECT (TWITCH to scroll, HOLD 1s to select)");
+        announceScenarioSelect();
       }
       return;
     }
@@ -275,9 +335,11 @@ void loop() {
           holdStartMs = now;
           holdBaseAx = avgAx;
           holdBaseAz = avgAz;
+          announceHoldStart();
         }
       } else if (!holdElevated) {
         holdingAngle = false;
+        Serial.println("STATUS:HOLD_CANCEL");
       } else {
         float dHoldAx = avgAx - holdBaseAx;
         float dHoldAz = avgAz - holdBaseAz;
@@ -289,6 +351,7 @@ void loop() {
           holdBaseAx = avgAx;
           holdBaseAz = avgAz;
           holdStartMs = now;
+          announceHoldStart();
         } else if (inPlace && now - holdStartMs >= HOLD_REQUIRED_MS) {
           holdingAngle = false;
           state = STATE_HOLD;
@@ -320,6 +383,7 @@ void loop() {
           Serial.println("*** STATE: STATE_TWITCH ***");
         } else {
           state = STATE_SCENARIO_SELECT;
+          announceScenarioSelect();
         }
         return;
       }
@@ -338,6 +402,7 @@ void loop() {
       // Wait for the table to settle back to rest before accepting new input
       if (nearRest && (now - lastTwitchMs >= REARM_DELAY_MS)) {
         state = STATE_SCENARIO_SELECT;
+        announceScenarioSelect();
       }
       return;
     }
@@ -361,7 +426,7 @@ void loop() {
       if (now - endedRoundMs >= REARM_DELAY_MS) {
         holdingAngle = false;
         state = STATE_SCENARIO_SELECT;
-        Serial.println("STATUS:SCENARIO_SELECT (TWITCH to scroll, HOLD 1s to select)");
+        announceScenarioSelect();
       }
     }
   }
