@@ -8,29 +8,25 @@ const float GYRO_SCALE  = 131.0f;   // LSB/(°/s)
 
 // Timing intervals (ms)
 const unsigned long CALIBRATION_MS         = 2000;
-const unsigned long SAMPLE_INTERVAL_MS     = 50;
-const unsigned long STREAM_INTERVAL_MS     = 100;
+const unsigned long SAMPLE_INTERVAL_MS     = 20;
 const unsigned long SETTLE_HOLD_MS         = 400;
 const unsigned long REARM_DELAY_MS         = 200;
-const unsigned long TWITCH_MAX_DURATION_MS = 450;
-const unsigned long TWITCH_DEBOUNCE_MS     = 250;
-const unsigned long HOLD_REQUIRED_MS       = 1500;
+const unsigned long TWITCH_MAX_DURATION_MS = 400;
+const unsigned long HOLD_REQUIRED_MS       = 1000;
 
 // Thresholds (tune to your tabletop mass and mounting)
 const float ACCEL_HOME_TOL_G    = 0.05f;
 const float GYRO_STILL_DPS      = 4.0f;
 
-const float TWITCH_ACCEL_MIN_G  = 0.06f;
-const float TWITCH_GYRO_MIN_DPS = 6.0f;
+const float TWITCH_HOME_TOL_G   = 0.10f;
 
-const float HOLD_ACCEL_MIN_G    = 0.08f;
-const float HOLD_MAX_GYRO_DPS   = 12.0f;
+const float HOLD_ACCEL_MIN_G    = 0.12f;
+const float HOLD_STABLE_TOL_G   = 0.08f;
 
 const float FLIP_ACCEL_MIN_G    = 0.35f;
-const float FLIP_GYRO_MIN_DPS   = 35.0f;
 
-// 3-sample moving average buffers
-const uint8_t WINDOW_SIZE = 3;
+// 2-sample moving average buffers
+const uint8_t WINDOW_SIZE = 2;
 float axBuf[WINDOW_SIZE] = {0.0f};
 float azBuf[WINDOW_SIZE] = {0.0f};
 float gxBuf[WINDOW_SIZE] = {0.0f};
@@ -62,26 +58,28 @@ uint16_t calibSamples = 0;
 enum GameState {
   STATE_CALIBRATING,
   STATE_SCENARIO_SELECT,
-  STATE_WAITING_FOR_FLIP,
+  STATE_SENSING,
+  STATE_TWITCH,
+  STATE_HOLD,
   STATE_FLIPPING,
   STATE_COOLDOWN
 };
 
 GameState state = STATE_CALIBRATING;
-uint8_t selectedScenario = 1;
 
 unsigned long bootMs = 0;
 unsigned long lastSampleMs = 0;
-unsigned long lastStreamMs = 0;
 unsigned long endedRoundMs = 0;
 
-// Twitch & Hold tracking
-bool twitchActive = false;
-unsigned long twitchStartMs = 0;
+// Sensing, twitch & hold tracking
+unsigned long sensingStartMs = 0;
 unsigned long lastTwitchMs = 0;
+unsigned long startTimeMs = 0;
 
 bool holdingAngle = false;
 unsigned long holdStartMs = 0;
+float holdBaseAx = 0.0f;
+float holdBaseAz = 0.0f;
 
 // Round return-to-start tracking
 bool trackingHomeCandidate = false;
@@ -153,6 +151,20 @@ void pushSample(float ax, float az, float gx, float gy, float gz) {
   avgGz = computeAverage(gzBuf, sampleCount);
 }
 
+void printRow(unsigned long now) {
+  Serial.print(now - startTimeMs);
+  Serial.print(',');
+  Serial.print(avgAx, 3);
+  Serial.print(',');
+  Serial.print(avgAz, 3);
+  Serial.print(',');
+  Serial.print(avgGx, 2);
+  Serial.print(',');
+  Serial.print(avgGy, 2);
+  Serial.print(',');
+  Serial.println(avgGz, 2);
+}
+
 void setup() {
   Serial.begin(115200);
   unsigned long startWait = millis();
@@ -178,9 +190,9 @@ void setup() {
 
   bootMs = millis();
   lastSampleMs = bootMs;
-  lastStreamMs = bootMs;
 
-  Serial.println("STATUS:CALIBRATING");
+  Serial.println("t_ms,ax,az,gx,gy,gz");
+  Serial.println("*** STATE: STATE_CALIBRATING ***");
 }
 
 void loop() {
@@ -225,90 +237,117 @@ void loop() {
         avgGz = 0.0f;
 
         holdingAngle = false;
-        twitchActive = false;
         state = STATE_SCENARIO_SELECT;
-        Serial.println("STATUS:SCENARIO_SELECT (TWITCH to scroll, HOLD 1.5s to select)");
+        Serial.println("*** STATE: STATE_SCENARIO_SELECT *** (TWITCH to scroll, HOLD 1s to select)");
       }
       return;
     }
 
     pushSample(axRaw, azRaw, gxRaw - gxBias, gyRaw - gyBias, gzRaw - gzBias);
+    if (state == STATE_SENSING || state == STATE_FLIPPING) {
+      printRow(now);
+    }
 
     float dAx = avgAx - axStart;
     float dAz = avgAz - azStart;
     float accelDelta = sqrt(dAx * dAx + dAz * dAz);
     float peakGyroDps = maxAbsThree(avgGx, avgGy, avgGz);
 
-    bool isAtStart  = (accelDelta <= ACCEL_HOME_TOL_G) && (peakGyroDps <= GYRO_STILL_DPS);
-    bool isFullFlip = (accelDelta >= FLIP_ACCEL_MIN_G) || (peakGyroDps >= FLIP_GYRO_MIN_DPS);
+    bool isAtStart = (accelDelta <= ACCEL_HOME_TOL_G) && (peakGyroDps <= GYRO_STILL_DPS);
+    bool nearRest  = (accelDelta <= TWITCH_HOME_TOL_G) && (peakGyroDps <= GYRO_STILL_DPS);
 
-    if (state == STATE_SCENARIO_SELECT) {
-      if (isFullFlip) {
-        state = STATE_FLIPPING;
-        trackingHomeCandidate = false;
-        lastStreamMs = now;
-        Serial.print("SELECTED_SCENARIO:");
-        Serial.println(selectedScenario);
-        Serial.println("STARTED ROUND");
-        return;
-      }
+    bool holdElevated = (accelDelta >= HOLD_ACCEL_MIN_G) && (accelDelta < FLIP_ACCEL_MIN_G);
 
-      // 1. HOLD detection: slight angle held steadily for >= 1500 ms
-      bool inHoldAngle = (accelDelta >= HOLD_ACCEL_MIN_G) &&
-                         (accelDelta < FLIP_ACCEL_MIN_G) &&
-                         (peakGyroDps <= HOLD_MAX_GYRO_DPS);
-
-      if (inHoldAngle) {
-        if (!holdingAngle) {
-          holdingAngle = true;
-          holdStartMs = now;
-        } else if (now - holdStartMs >= HOLD_REQUIRED_MS) {
-          holdingAngle = false;
-          twitchActive = false;
-          state = STATE_WAITING_FOR_FLIP;
-          Serial.println("HOLD");
-          Serial.print("SELECTED_SCENARIO:");
-          Serial.println(selectedScenario);
-        }
-      } else {
-        holdingAngle = false;
-      }
-
-      // 2. TWITCH detection: small quick movement returning near start within TWITCH_MAX_DURATION_MS
-      bool hasTwitchSignal = (accelDelta >= TWITCH_ACCEL_MIN_G) || (peakGyroDps >= TWITCH_GYRO_MIN_DPS);
-
-      if (!twitchActive && hasTwitchSignal && (now - lastTwitchMs >= TWITCH_DEBOUNCE_MS)) {
-        twitchActive = true;
-        twitchStartMs = now;
-      } else if (twitchActive) {
-        if (now - twitchStartMs > TWITCH_MAX_DURATION_MS) {
-          twitchActive = false;
-        } else if (isAtStart) {
-          twitchActive = false;
-          lastTwitchMs = now;
-          selectedScenario = (selectedScenario == 1) ? 2 : 1;
-          Serial.println("TWITCH");
-          Serial.print("SCENARIO_OPTION:");
-          Serial.println(selectedScenario);
-        }
+    if (state == STATE_HOLD) {
+      // Held selection stays active until the table is lowered back to rest
+      if (nearRest) {
+        state = STATE_SCENARIO_SELECT;
+        Serial.println("STATUS:SCENARIO_SELECT (TWITCH to scroll, HOLD 1s to select)");
       }
       return;
     }
 
-    // Scenario already chosen—wait for the player's flip attempt
-    bool isMoving = (accelDelta >= HOLD_ACCEL_MIN_G) || (peakGyroDps >= TWITCH_GYRO_MIN_DPS);
+    bool canHold = (state == STATE_SCENARIO_SELECT || state == STATE_SENSING || state == STATE_TWITCH);
+    if (canHold) {
+      if (!holdingAngle) {
+        if (holdElevated) {
+          holdingAngle = true;
+          holdStartMs = now;
+          holdBaseAx = avgAx;
+          holdBaseAz = avgAz;
+        }
+      } else if (!holdElevated) {
+        holdingAngle = false;
+      } else {
+        float dHoldAx = avgAx - holdBaseAx;
+        float dHoldAz = avgAz - holdBaseAz;
+        bool inPlace = sqrt(dHoldAx * dHoldAx + dHoldAz * dHoldAz) <= HOLD_STABLE_TOL_G;
 
-    if (state == STATE_WAITING_FOR_FLIP && isMoving) {
-      state = STATE_FLIPPING;
-      trackingHomeCandidate = false;
-      lastStreamMs = now;
-      Serial.println("STARTED ROUND");
-    } else if (state == STATE_FLIPPING) {
+        // Table is still but has settled at a new angle: re-anchor and restart the timer.
+        // Movement while the table is not still is ignored, so it can't cancel the hold.
+        if (!inPlace && peakGyroDps <= GYRO_STILL_DPS) {
+          holdBaseAx = avgAx;
+          holdBaseAz = avgAz;
+          holdStartMs = now;
+        } else if (inPlace && now - holdStartMs >= HOLD_REQUIRED_MS) {
+          holdingAngle = false;
+          state = STATE_HOLD;
+          Serial.println("*** STATE: STATE_HOLD ***");
+          return;
+        }
+      }
+    }
+
+    if (state == STATE_SCENARIO_SELECT) {
+      if (!nearRest) {
+        state = STATE_SENSING;
+        Serial.println("*** STATE: STATE_SENSING ***");
+        sensingStartMs = now;
+        startTimeMs = now;
+      }
+      return;
+    }
+
+    if (state == STATE_SENSING) {
+      bool withinTwitchWindow = (now - sensingStartMs < TWITCH_MAX_DURATION_MS);
+
+      // Back at rest inside the window is a TWITCH; after it, a non-holding table is a FLIP
+      if (nearRest) {
+        if (withinTwitchWindow) {
+          state = STATE_TWITCH;
+          lastTwitchMs = now;
+          Serial.println("*** STATE: STATE_TWITCH ***");
+        } else {
+          state = STATE_SCENARIO_SELECT;
+        }
+        return;
+      }
+
+      if (!withinTwitchWindow && !holdingAngle) {
+        state = STATE_FLIPPING;
+        Serial.println("*** STATE: STATE_FLIPPING ***");
+        startTimeMs = sensingStartMs;
+        trackingHomeCandidate = false;
+        Serial.println("STARTED ROUND");
+      }
+      return;
+    }
+
+    if (state == STATE_TWITCH) {
+      // Wait for the table to settle back to rest before accepting new input
+      if (nearRest && (now - lastTwitchMs >= REARM_DELAY_MS)) {
+        state = STATE_SCENARIO_SELECT;
+      }
+      return;
+    }
+
+    if (state == STATE_FLIPPING) {
       if (isAtStart) {
         if (!trackingHomeCandidate) {
           trackingHomeCandidate = true;
           homeCandidateSinceMs = now;
         } else if (now - homeCandidateSinceMs >= SETTLE_HOLD_MS) {
+          Serial.println("*** STATE: STATE_COOLDOWN ***");
           state = STATE_COOLDOWN;
           endedRoundMs = now;
           trackingHomeCandidate = false;
@@ -320,28 +359,10 @@ void loop() {
     } else if (state == STATE_COOLDOWN) {
       if (now - endedRoundMs >= REARM_DELAY_MS) {
         holdingAngle = false;
-        twitchActive = false;
         state = STATE_SCENARIO_SELECT;
-        Serial.println("STATUS:SCENARIO_SELECT (TWITCH to scroll, HOLD 1.5s to select)");
+        Serial.println("STATUS:SCENARIO_SELECT (TWITCH to scroll, HOLD 1s to select)");
       }
     }
   }
 
-  // Stream averaged values every 100 ms while the table is actively flipping
-  if (state == STATE_FLIPPING && (now - lastStreamMs >= STREAM_INTERVAL_MS)) {
-    lastStreamMs += STREAM_INTERVAL_MS;
-
-    Serial.print("t_ms:");
-    Serial.print(now - bootMs);
-    Serial.print(",ax:");
-    Serial.print(avgAx, 3);
-    Serial.print(",az:");
-    Serial.print(avgAz, 3);
-    Serial.print(",gx:");
-    Serial.print(avgGx, 2);
-    Serial.print(",gy:");
-    Serial.print(avgGy, 2);
-    Serial.print(",gz:");
-    Serial.println(avgGz, 2);
-  }
 }
