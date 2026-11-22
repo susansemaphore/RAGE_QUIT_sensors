@@ -21,7 +21,9 @@ const unsigned long TWITCH_MAX_DURATION_MS = 400;
 const unsigned long HOLD_REQUIRED_MS       = 1000;
 
 // Thresholds (tune to your tabletop mass and mounting)
-const float ACCEL_HOME_TOL_G    = 0.05f;
+// A flipped table that settles this close to its rest angle, and stays still, ends the round. It can land a few
+// degrees off (0.09 g in testing), which a tighter tolerance never accepted, leaving the round stuck.
+const float ROUND_SETTLED_TOL_G = 0.10f;
 const float GYRO_STILL_DPS      = 4.0f;
 
 const float TWITCH_HOME_TOL_G   = 0.10f;
@@ -83,6 +85,7 @@ unsigned long lastTwitchMs = 0;
 unsigned long startTimeMs = 0;
 
 bool holdingAngle = false;
+bool holdAnnounced = false;
 unsigned long holdStartMs = 0;
 float holdBaseAx = 0.0f;
 float holdBaseAz = 0.0f;
@@ -108,16 +111,20 @@ void announceScenarioSelect() {
   Serial.println("STATUS:SCENARIO_SELECT (TWITCH to scroll, HOLD 1s to select)");
 }
 
-// Sent whenever the 1 s hold timer starts or restarts, with the time still needed, so the PC can fill a bar in step.
-void announceHoldStart() {
+// Sent once the table is tilted AND still, with the ms left until the hold completes, so the PC can fill a bar in
+// step. Waiting for stillness keeps it quiet while the table only swings through the hold angle.
+void announceHoldStart(unsigned long now) {
+  unsigned long held = now - holdStartMs;
   Serial.print("STATUS:HOLD_START ");
-  Serial.println(HOLD_REQUIRED_MS);
+  Serial.println(held < HOLD_REQUIRED_MS ? HOLD_REQUIRED_MS - held : 0UL);
+  holdAnnounced = true;
 }
 
 void startCalibration(unsigned long now) {
   calibAxSum = calibAzSum = calibGxSum = calibGySum = calibGzSum = 0.0;
   calibSamples = 0;
   holdingAngle = false;
+  holdAnnounced = false;
   trackingHomeCandidate = false;
   bootMs = now;
   state = STATE_CALIBRATING;
@@ -297,6 +304,7 @@ void loop() {
         avgGz = 0.0f;
 
         holdingAngle = false;
+        holdAnnounced = false;
         state = STATE_SCENARIO_SELECT;
         Serial.println("*** STATE: STATE_SCENARIO_SELECT *** (TWITCH to scroll, HOLD 1s to select)");
       }
@@ -313,8 +321,8 @@ void loop() {
     float accelDelta = sqrt(dAx * dAx + dAz * dAz);
     float peakGyroDps = maxAbsThree(avgGx, avgGy, avgGz);
 
-    bool isAtStart = (accelDelta <= ACCEL_HOME_TOL_G) && (peakGyroDps <= GYRO_STILL_DPS);
-    bool nearRest  = (accelDelta <= TWITCH_HOME_TOL_G) && (peakGyroDps <= GYRO_STILL_DPS);
+    bool settledDown = (accelDelta <= ROUND_SETTLED_TOL_G) && (peakGyroDps <= GYRO_STILL_DPS);
+    bool nearRest    = (accelDelta <= TWITCH_HOME_TOL_G) && (peakGyroDps <= GYRO_STILL_DPS);
 
     bool holdElevated = (accelDelta >= HOLD_ACCEL_MIN_G) && (accelDelta < FLIP_ACCEL_MIN_G);
 
@@ -332,31 +340,36 @@ void loop() {
       if (!holdingAngle) {
         if (holdElevated) {
           holdingAngle = true;
+          holdAnnounced = false;
           holdStartMs = now;
           holdBaseAx = avgAx;
           holdBaseAz = avgAz;
-          announceHoldStart();
         }
       } else if (!holdElevated) {
         holdingAngle = false;
-        Serial.println("STATUS:HOLD_CANCEL");
+        if (holdAnnounced) Serial.println("STATUS:HOLD_CANCEL");
+        holdAnnounced = false;
       } else {
         float dHoldAx = avgAx - holdBaseAx;
         float dHoldAz = avgAz - holdBaseAz;
         bool inPlace = sqrt(dHoldAx * dHoldAx + dHoldAz * dHoldAz) <= HOLD_STABLE_TOL_G;
+        bool still = peakGyroDps <= GYRO_STILL_DPS;
 
         // Table is still but has settled at a new angle: re-anchor and restart the timer.
         // Movement while the table is not still is ignored, so it can't cancel the hold.
-        if (!inPlace && peakGyroDps <= GYRO_STILL_DPS) {
+        if (!inPlace && still) {
           holdBaseAx = avgAx;
           holdBaseAz = avgAz;
           holdStartMs = now;
-          announceHoldStart();
+          announceHoldStart(now);
         } else if (inPlace && now - holdStartMs >= HOLD_REQUIRED_MS) {
           holdingAngle = false;
+          holdAnnounced = false;
           state = STATE_HOLD;
           Serial.println("*** STATE: STATE_HOLD ***");
           return;
+        } else if (inPlace && still && !holdAnnounced) {
+          announceHoldStart(now);
         }
       }
     }
@@ -408,11 +421,14 @@ void loop() {
     }
 
     if (state == STATE_FLIPPING) {
-      if (isAtStart) {
+      if (settledDown) {
         if (!trackingHomeCandidate) {
           trackingHomeCandidate = true;
           homeCandidateSinceMs = now;
         } else if (now - homeCandidateSinceMs >= SETTLE_HOLD_MS) {
+          // Adopt the angle it landed at as the new rest, so twitch and hold are measured from where it really sits.
+          axStart = avgAx;
+          azStart = avgAz;
           Serial.println("*** STATE: STATE_COOLDOWN ***");
           state = STATE_COOLDOWN;
           endedRoundMs = now;
@@ -425,6 +441,7 @@ void loop() {
     } else if (state == STATE_COOLDOWN) {
       if (now - endedRoundMs >= REARM_DELAY_MS) {
         holdingAngle = false;
+        holdAnnounced = false;
         state = STATE_SCENARIO_SELECT;
         announceScenarioSelect();
       }

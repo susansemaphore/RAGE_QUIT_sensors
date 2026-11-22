@@ -42,12 +42,12 @@ USB serial, **115200 baud**, one message per line. The Pro Micro only sends whil
 | `*** STATE: STATE_CALIBRATING ***` | Learning "at rest" for 2 s (at power-up, or after `CAL`). Keep the table still. |
 | `STATUS:SCENARIO_SELECT (…)` | Idle, table at rest. Now sent on **every** return to idle (after a twitch, a dropped lift, a hold or a round). |
 | `*** STATE: STATE_SENSING ***` | The table started moving. Followed by a `t_ms,ax,az,gx,gy,gz` header and one CSV row per 20 ms sample while sensing/flipping. |
-| `STATUS:HOLD_START 1000` | A steady tilt was found; the hold completes after this many ms if it stays put. Sent again whenever the timer restarts. |
-| `STATUS:HOLD_CANCEL` | The tilt was lost before the hold completed. |
+| `STATUS:HOLD_START 820` | The table is tilted into the hold angle **and still**; the number is the ms left until the hold completes. Sent again (with the full 1000) whenever the timer restarts. Not sent while the table only swings through the hold angle. |
+| `STATUS:HOLD_CANCEL` | The tilt was lost after a `HOLD_START`, before the hold completed. |
 | `*** STATE: STATE_HOLD ***` | Hold completed (selection). |
 | `*** STATE: STATE_TWITCH ***` | Quick lift-and-drop (back at rest within 400 ms). |
 | `*** STATE: STATE_FLIPPING ***` then `STARTED ROUND` | Still moving after 400 ms and not holding: a flip. |
-| `*** STATE: STATE_COOLDOWN ***` then `ENDED ROUND` | Back at rest for 400 ms after a flip. |
+| `*** STATE: STATE_COOLDOWN ***` then `ENDED ROUND` | After a flip, the table has been still for 400 ms within 0.10 g of its rest angle. That spot becomes the new rest, since a flipped table often lands a few degrees off and would otherwise never count as "home". |
 | `PONG RAGE_QUIT` | Reply to `PING`. |
 
 ## Commands (PC → Arduino)
