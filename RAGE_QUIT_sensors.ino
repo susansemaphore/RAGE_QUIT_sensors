@@ -7,52 +7,85 @@ const float ACCEL_SCALE = 16384.0f; // LSB/g
 const float GYRO_SCALE  = 131.0f;   // LSB/(°/s)
 
 // Timing intervals (ms)
-const unsigned long CALIBRATION_MS       = 2000;
-const unsigned long SAMPLE_INTERVAL_MS   = 50;
-const unsigned long STREAM_INTERVAL_MS   = 100;
-const unsigned long SETTLE_HOLD_MS       = 400; // Must stay in start zone this long to end attempt
+const unsigned long CALIBRATION_MS         = 2000;
+const unsigned long SAMPLE_INTERVAL_MS     = 50;
+const unsigned long STREAM_INTERVAL_MS     = 100;
+const unsigned long SETTLE_HOLD_MS         = 400;
+const unsigned long REARM_DELAY_MS         = 200;
+const unsigned long TWITCH_MAX_DURATION_MS = 450;
+const unsigned long TWITCH_DEBOUNCE_MS     = 250;
+const unsigned long HOLD_REQUIRED_MS       = 1500;
 
-// Motion & "back at start" thresholds (tune to your table's weight/noise)
-const float ACCEL_START_DELTA_G = 0.08f; // Deviation from starting (ax, az) that counts as moving
-const float ACCEL_HOME_TOL_G    = 0.05f; // Max (ax, az) difference from start to count as "back in start position"
-const float GYRO_MOVE_DPS       = 8.0f;  // |gz| above this (deg/s) indicates active rotation
-const float GYRO_STILL_DPS      = 4.0f;  // |gz| below this (deg/s) indicates rotation has stopped
+// Thresholds (tune to your tabletop mass and mounting)
+const float ACCEL_HOME_TOL_G    = 0.05f;
+const float GYRO_STILL_DPS      = 4.0f;
+
+const float TWITCH_ACCEL_MIN_G  = 0.06f;
+const float TWITCH_GYRO_MIN_DPS = 6.0f;
+
+const float HOLD_ACCEL_MIN_G    = 0.08f;
+const float HOLD_MAX_GYRO_DPS   = 12.0f;
+
+const float FLIP_ACCEL_MIN_G    = 0.35f;
+const float FLIP_GYRO_MIN_DPS   = 35.0f;
 
 // 3-sample moving average buffers
 const uint8_t WINDOW_SIZE = 3;
 float axBuf[WINDOW_SIZE] = {0.0f};
 float azBuf[WINDOW_SIZE] = {0.0f};
+float gxBuf[WINDOW_SIZE] = {0.0f};
+float gyBuf[WINDOW_SIZE] = {0.0f};
 float gzBuf[WINDOW_SIZE] = {0.0f};
 uint8_t bufIndex = 0;
 uint8_t sampleCount = 0;
 
 float avgAx = 0.0f;
 float avgAz = 0.0f;
+float avgGx = 0.0f;
+float avgGy = 0.0f;
 float avgGz = 0.0f;
 
-// Calibration baseline values (captured during first 2 seconds)
+// Calibration baseline values (first 2 seconds)
 float axStart = 0.0f;
 float azStart = 0.0f;
+float gxBias  = 0.0f;
+float gyBias  = 0.0f;
 float gzBias  = 0.0f;
 
 double calibAxSum = 0.0;
 double calibAzSum = 0.0;
+double calibGxSum = 0.0;
+double calibGySum = 0.0;
 double calibGzSum = 0.0;
 uint16_t calibSamples = 0;
 
 enum GameState {
   STATE_CALIBRATING,
+  STATE_SCENARIO_SELECT,
   STATE_WAITING_FOR_FLIP,
   STATE_FLIPPING,
-  STATE_FINISHED
+  STATE_COOLDOWN
 };
 
 GameState state = STATE_CALIBRATING;
+uint8_t selectedScenario = 1;
+
 unsigned long bootMs = 0;
 unsigned long lastSampleMs = 0;
 unsigned long lastStreamMs = 0;
-unsigned long homeCandidateSinceMs = 0;
+unsigned long endedRoundMs = 0;
+
+// Twitch & Hold tracking
+bool twitchActive = false;
+unsigned long twitchStartMs = 0;
+unsigned long lastTwitchMs = 0;
+
+bool holdingAngle = false;
+unsigned long holdStartMs = 0;
+
+// Round return-to-start tracking
 bool trackingHomeCandidate = false;
+unsigned long homeCandidateSinceMs = 0;
 
 float computeAverage(const float* buf, uint8_t count) {
   if (count == 0) return 0.0f;
@@ -63,7 +96,14 @@ float computeAverage(const float* buf, uint8_t count) {
   return sum / count;
 }
 
-bool readRawAxAzGz(float& axOut, float& azOut, float& gzOut) {
+float maxAbsThree(float a, float b, float c) {
+  float m = fabs(a);
+  if (fabs(b) > m) m = fabs(b);
+  if (fabs(c) > m) m = fabs(c);
+  return m;
+}
+
+bool readRawSensors(float& axOut, float& azOut, float& gxOut, float& gyOut, float& gzOut) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B); // ACCEL_XOUT_H
   if (Wire.endTransmission(false) != 0) {
@@ -82,19 +122,23 @@ bool readRawAxAzGz(float& axOut, float& azOut, float& gzOut) {
 
   (void)Wire.read(); (void)Wire.read();              // 0x41–0x42 (Temp skipped)
 
-  (void)Wire.read(); (void)Wire.read();              // 0x43–0x44 (Gyro X skipped)
-  (void)Wire.read(); (void)Wire.read();              // 0x45–0x46 (Gyro Y skipped)
+  int16_t rawGx = (Wire.read() << 8) | Wire.read(); // 0x43–0x44
+  int16_t rawGy = (Wire.read() << 8) | Wire.read(); // 0x45–0x46
   int16_t rawGz = (Wire.read() << 8) | Wire.read(); // 0x47–0x48
 
   axOut = rawAx / ACCEL_SCALE;
   azOut = rawAz / ACCEL_SCALE;
+  gxOut = rawGx / GYRO_SCALE;
+  gyOut = rawGy / GYRO_SCALE;
   gzOut = rawGz / GYRO_SCALE;
   return true;
 }
 
-void pushSample(float ax, float az, float gz) {
+void pushSample(float ax, float az, float gx, float gy, float gz) {
   axBuf[bufIndex] = ax;
   azBuf[bufIndex] = az;
+  gxBuf[bufIndex] = gx;
+  gyBuf[bufIndex] = gy;
   gzBuf[bufIndex] = gz;
 
   bufIndex = (bufIndex + 1) % WINDOW_SIZE;
@@ -104,6 +148,8 @@ void pushSample(float ax, float az, float gz) {
 
   avgAx = computeAverage(axBuf, sampleCount);
   avgAz = computeAverage(azBuf, sampleCount);
+  avgGx = computeAverage(gxBuf, sampleCount);
+  avgGy = computeAverage(gyBuf, sampleCount);
   avgGz = computeAverage(gzBuf, sampleCount);
 }
 
@@ -134,7 +180,7 @@ void setup() {
   lastSampleMs = bootMs;
   lastStreamMs = bootMs;
 
-  Serial.println("STATUS:CALIBRATING (keep table at starting position for 2s)");
+  Serial.println("STATUS:CALIBRATING");
 }
 
 void loop() {
@@ -143,52 +189,114 @@ void loop() {
   if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
     lastSampleMs += SAMPLE_INTERVAL_MS;
 
-    float axRaw = 0.0f, azRaw = 0.0f, gzRaw = 0.0f;
-    if (!readRawAxAzGz(axRaw, azRaw, gzRaw)) {
+    float axRaw = 0.0f, azRaw = 0.0f, gxRaw = 0.0f, gyRaw = 0.0f, gzRaw = 0.0f;
+    if (!readRawSensors(axRaw, azRaw, gxRaw, gyRaw, gzRaw)) {
       return;
     }
 
     if (state == STATE_CALIBRATING) {
       calibAxSum += axRaw;
       calibAzSum += azRaw;
+      calibGxSum += gxRaw;
+      calibGySum += gyRaw;
       calibGzSum += gzRaw;
       calibSamples++;
 
       if (now - bootMs >= CALIBRATION_MS && calibSamples > 0) {
         axStart = calibAxSum / calibSamples;
         azStart = calibAzSum / calibSamples;
+        gxBias  = calibGxSum / calibSamples;
+        gyBias  = calibGySum / calibSamples;
         gzBias  = calibGzSum / calibSamples;
 
         for (uint8_t i = 0; i < WINDOW_SIZE; i++) {
           axBuf[i] = axStart;
           azBuf[i] = azStart;
+          gxBuf[i] = 0.0f;
+          gyBuf[i] = 0.0f;
           gzBuf[i] = 0.0f;
         }
         bufIndex = 0;
         sampleCount = WINDOW_SIZE;
         avgAx = axStart;
         avgAz = azStart;
+        avgGx = 0.0f;
+        avgGy = 0.0f;
         avgGz = 0.0f;
 
-        state = STATE_WAITING_FOR_FLIP;
-        Serial.print("STATUS:READY | axStart=");
-        Serial.print(axStart, 3);
-        Serial.print(" azStart=");
-        Serial.print(azStart, 3);
-        Serial.print(" gzBias=");
-        Serial.println(gzBias, 2);
+        holdingAngle = false;
+        twitchActive = false;
+        state = STATE_SCENARIO_SELECT;
+        Serial.println("STATUS:SCENARIO_SELECT (TWITCH to scroll, HOLD 1.5s to select)");
       }
       return;
     }
 
-    float gzCorrected = gzRaw - gzBias;
-    pushSample(axRaw, azRaw, gzCorrected);
+    pushSample(axRaw, azRaw, gxRaw - gxBias, gyRaw - gyBias, gzRaw - gzBias);
 
     float dAx = avgAx - axStart;
     float dAz = avgAz - azStart;
     float accelDelta = sqrt(dAx * dAx + dAz * dAz);
-    bool isAtStart = (accelDelta <= ACCEL_HOME_TOL_G) && (fabs(avgGz) <= GYRO_STILL_DPS);
-    bool isMoving  = (accelDelta >= ACCEL_START_DELTA_G) || (fabs(avgGz) >= GYRO_MOVE_DPS);
+    float peakGyroDps = maxAbsThree(avgGx, avgGy, avgGz);
+
+    bool isAtStart  = (accelDelta <= ACCEL_HOME_TOL_G) && (peakGyroDps <= GYRO_STILL_DPS);
+    bool isFullFlip = (accelDelta >= FLIP_ACCEL_MIN_G) || (peakGyroDps >= FLIP_GYRO_MIN_DPS);
+
+    if (state == STATE_SCENARIO_SELECT) {
+      if (isFullFlip) {
+        state = STATE_FLIPPING;
+        trackingHomeCandidate = false;
+        lastStreamMs = now;
+        Serial.print("SELECTED_SCENARIO:");
+        Serial.println(selectedScenario);
+        Serial.println("STARTED ROUND");
+        return;
+      }
+
+      // 1. HOLD detection: slight angle held steadily for >= 1500 ms
+      bool inHoldAngle = (accelDelta >= HOLD_ACCEL_MIN_G) &&
+                         (accelDelta < FLIP_ACCEL_MIN_G) &&
+                         (peakGyroDps <= HOLD_MAX_GYRO_DPS);
+
+      if (inHoldAngle) {
+        if (!holdingAngle) {
+          holdingAngle = true;
+          holdStartMs = now;
+        } else if (now - holdStartMs >= HOLD_REQUIRED_MS) {
+          holdingAngle = false;
+          twitchActive = false;
+          state = STATE_WAITING_FOR_FLIP;
+          Serial.println("HOLD");
+          Serial.print("SELECTED_SCENARIO:");
+          Serial.println(selectedScenario);
+        }
+      } else {
+        holdingAngle = false;
+      }
+
+      // 2. TWITCH detection: small quick movement returning near start within TWITCH_MAX_DURATION_MS
+      bool hasTwitchSignal = (accelDelta >= TWITCH_ACCEL_MIN_G) || (peakGyroDps >= TWITCH_GYRO_MIN_DPS);
+
+      if (!twitchActive && hasTwitchSignal && (now - lastTwitchMs >= TWITCH_DEBOUNCE_MS)) {
+        twitchActive = true;
+        twitchStartMs = now;
+      } else if (twitchActive) {
+        if (now - twitchStartMs > TWITCH_MAX_DURATION_MS) {
+          twitchActive = false;
+        } else if (isAtStart) {
+          twitchActive = false;
+          lastTwitchMs = now;
+          selectedScenario = (selectedScenario == 1) ? 2 : 1;
+          Serial.println("TWITCH");
+          Serial.print("SCENARIO_OPTION:");
+          Serial.println(selectedScenario);
+        }
+      }
+      return;
+    }
+
+    // Scenario already chosen—wait for the player's flip attempt
+    bool isMoving = (accelDelta >= HOLD_ACCEL_MIN_G) || (peakGyroDps >= TWITCH_GYRO_MIN_DPS);
 
     if (state == STATE_WAITING_FOR_FLIP && isMoving) {
       state = STATE_FLIPPING;
@@ -201,11 +309,20 @@ void loop() {
           trackingHomeCandidate = true;
           homeCandidateSinceMs = now;
         } else if (now - homeCandidateSinceMs >= SETTLE_HOLD_MS) {
-          state = STATE_FINISHED;
+          state = STATE_COOLDOWN;
+          endedRoundMs = now;
+          trackingHomeCandidate = false;
           Serial.println("ENDED ROUND");
         }
       } else {
         trackingHomeCandidate = false;
+      }
+    } else if (state == STATE_COOLDOWN) {
+      if (now - endedRoundMs >= REARM_DELAY_MS) {
+        holdingAngle = false;
+        twitchActive = false;
+        state = STATE_SCENARIO_SELECT;
+        Serial.println("STATUS:SCENARIO_SELECT (TWITCH to scroll, HOLD 1.5s to select)");
       }
     }
   }
@@ -220,6 +337,10 @@ void loop() {
     Serial.print(avgAx, 3);
     Serial.print(",az:");
     Serial.print(avgAz, 3);
+    Serial.print(",gx:");
+    Serial.print(avgGx, 2);
+    Serial.print(",gy:");
+    Serial.print(avgGy, 2);
     Serial.print(",gz:");
     Serial.println(avgGz, 2);
   }
