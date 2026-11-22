@@ -302,6 +302,7 @@ void loop() {
       if (!nearRest) {
         state = STATE_SENSING;
         Serial.println("*** STATE: STATE_SENSING ***");
+        Serial.println("t_ms,ax,az,gx,gy,gz");
         sensingStartMs = now;
         startTimeMs = now;
       }
